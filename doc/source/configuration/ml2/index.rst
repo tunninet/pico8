@@ -23,7 +23,7 @@ refer to :doc:`device_drivers/index` for details.
 
 .. code-block:: ini
 
-  [networking_baremetal]
+  [networking_baremetal_pica8]
   enabled_device = device_a.example.net,device_b.example.net
 
 .. toctree::

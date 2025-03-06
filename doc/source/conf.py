@@ -62,7 +62,7 @@ config_generator_config_file = [
 # sample_config_basename = '_static/ironic_neutron_agent.ini'
 
 # A list of ignored prefixes for module index sorting.
-modindex_common_prefix = ['networking_baremetal.']
+modindex_common_prefix = ['networking_baremetal_pica8.']
 
 # If true, '()' will be appended to :func: etc. cross-reference text.
 add_function_parentheses = True
@@ -108,7 +108,7 @@ latex_documents = [
 
 # -- sphinxcontrib.apidoc configuration --------------------------------------
 
-apidoc_module_dir = '../../networking_baremetal'
+apidoc_module_dir = '../../networking_baremetal_pica8'
 apidoc_output_dir = 'contributor/api'
 apidoc_excluded_paths = [
     'tests',

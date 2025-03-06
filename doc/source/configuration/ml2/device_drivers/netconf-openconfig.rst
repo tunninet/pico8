@@ -15,7 +15,7 @@ This driver has been tested with the following switch vendor/operating systems:
 
 .. code-block:: ini
 
-  [networking_baremetal]
+  [networking_baremetal_pica8]
   enabled_devices = nexus.example.net
 
   [nexus.example.net]
@@ -31,7 +31,7 @@ This driver has been tested with the following switch vendor/operating systems:
 
 .. code-block:: ini
 
-  [networking_baremetal]
+  [networking_baremetal_pica8]
   enabled_devices = arista.example.net
 
   [arista.example.net]

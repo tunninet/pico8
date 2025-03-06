@@ -33,7 +33,7 @@ networking-baremetal with ironic. Here is an example of local.conf::
 
     # Enable ironic plugin
     enable_plugin ironic https://opendev.org/openstack/ironic
-    enable_service networking_baremetal
+    enable_service networking_baremetal_pica8
 
     # Enable neutron which is required by ironic and disable nova-network.
     disable_service n-net

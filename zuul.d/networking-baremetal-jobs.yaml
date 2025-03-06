@@ -54,7 +54,7 @@
         s-object: True
         s-proxy: True
         generic_switch: True
-        networking_baremetal: True
+        networking_baremetal_pica8: True
         ir-neutronagt: True
         neutron-api: False
         neutron-agent: False

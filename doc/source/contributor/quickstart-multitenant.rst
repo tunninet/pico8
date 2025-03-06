@@ -32,7 +32,7 @@ multi-tenant networking. Here is an example of local.conf::
 
     # Enable networking-baremetal plugin
     enable_plugin networking-baremetal https://opendev.org/openstack/networking-baremetal.git
-    enable_service networking_baremetal
+    enable_service networking_baremetal_pica8
     enable_service ir-neutronagt
 
     # Add link local info when registering Ironic node
