@@ -1,0 +1,14 @@
+- project:
+    templates:
+      - check-requirements
+      - openstack-python3-jobs-neutron
+      - publish-openstack-docs-pti
+      - release-notes-jobs-python3
+    check:
+      jobs:
+        - networking-baremetal-multitenant-vlans
+        - networking-baremetal-tox-codespell:
+            voting: false
+    gate:
+      jobs:
+        - networking-baremetal-multitenant-vlans
