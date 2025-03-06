@@ -7,32 +7,32 @@
 # (none)
 
 # Save trace setting
-_XTRACE_NETWORKING_BAREMETAL=$(set +o | grep xtrace)
+_XTRACE_networking_baremetal_pica8=$(set +o | grep xtrace)
 set +o xtrace
 
 # Defaults
 # --------
 
 # networking-baremetal service
-NETWORKING_BAREMETAL_REPO=${NETWORKING_BAREMETAL_REPO:-${GIT_BASE}/openstack/networking-baremetal.git}
-NETWORKING_BAREMETAL_BRANCH=${NETWORKING_BAREMETAL_BRANCH:-master}
+networking_baremetal_pica8_REPO=${networking_baremetal_pica8_REPO:-${GIT_BASE}/openstack/networking-baremetal.git}
+networking_baremetal_pica8_BRANCH=${networking_baremetal_pica8_BRANCH:-master}
 
-NETWORKING_BAREMETAL_DIR=${NETWORKING_BAREMETAL_DIR:-$DEST/networking-baremetal}
-NETWORKING_BAREMETAL_DATA_DIR=""$DATA_DIR/networking-baremetal""
+networking_baremetal_pica8_DIR=${networking_baremetal_pica8_DIR:-$DEST/networking-baremetal}
+networking_baremetal_pica8_DATA_DIR=""$DATA_DIR/networking-baremetal""
 
 # Support entry points installation of console scripts
-NETWORKING_BAREMETAL_BIN_DIR=$(get_python_exec_prefix)
+networking_baremetal_pica8_BIN_DIR=$(get_python_exec_prefix)
 
 
 # Functions
 # ---------
 
-function install_networking_baremetal {
-    setup_develop $NETWORKING_BAREMETAL_DIR
+function install_networking_baremetal_pica8 {
+    setup_develop $networking_baremetal_pica8_DIR
 }
 
 
-function configure_networking_baremetal {
+function configure_networking_baremetal_pica8 {
     if [[ -z "$Q_ML2_PLUGIN_MECHANISM_DRIVERS" ]]; then
         Q_ML2_PLUGIN_MECHANISM_DRIVERS='baremetal'
     else
@@ -43,19 +43,19 @@ function configure_networking_baremetal {
     populate_ml2_config /$Q_PLUGIN_CONF_FILE ml2 mechanism_drivers=$Q_ML2_PLUGIN_MECHANISM_DRIVERS
 }
 
-function configure_networking_baremetal_neutron_agent {
+function configure_networking_baremetal_pica8_neutron_agent {
     configure_keystone_authtoken_middleware $NEUTRON_CONF ironic ironic
     configure_placement_nova_compute $NEUTRON_CONF
 }
 
-function start_networking_baremetal_neutron_agent {
-    run_process ir-neutronagt "$NETWORKING_BAREMETAL_BIN_DIR/ironic-neutron-agent"
+function start_networking_baremetal_pica8_neutron_agent {
+    run_process ir-neutronagt "$networking_baremetal_pica8_BIN_DIR/ironic-neutron-agent"
 }
 
-function stop_networking_baremetal_neutron_agent {
+function stop_networking_baremetal_pica8_neutron_agent {
     stop_process ir-neutronagt
 }
 
-function cleanup_networking_baremetal {
-    rm -rf $NETWORKING_BAREMETAL_DATA_DIR
+function cleanup_networking_baremetal_pica8 {
+    rm -rf $networking_baremetal_pica8_DATA_DIR
 }

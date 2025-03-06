@@ -1,5 +1,5 @@
-# settings file for networking_baremetal
+# settings file for networking_baremetal_pica8
 define_plugin networking-baremetal
 plugin_requires networking-baremetal ironic
 plugin_requires networking-baremetal networking-generic-switch
-enable_service networking_baremetal
+enable_service networking_baremetal_pica8

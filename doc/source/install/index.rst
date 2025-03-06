@@ -61,7 +61,7 @@ configuration defines the device and driver specific configuration.
 
 .. code-block:: ini
 
-  [networking_baremetal]
+  [networking_baremetal_pica8]
   enabled_devices = device_a.example.net,device_b.example.net
 
   [device_a.example.net]

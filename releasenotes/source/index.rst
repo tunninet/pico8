@@ -1,5 +1,5 @@
 ===================================
- networking_baremetal Release Notes
+ networking_baremetal_pica8 Release Notes
 ===================================
 
 .. toctree::
