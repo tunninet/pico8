@@ -141,7 +141,7 @@ class NetconfLockDenied(n_exec.NeutronException):
                'lock is currently held by another entity.')
 
 
-class NetconfOpenConfigClient(base.BaseDeviceClient):
+class NetconfPicoClient(base.BaseDeviceClient):
 
     def __init__(self, device):
         super().__init__(device)
@@ -403,7 +403,7 @@ class NetconfOpenConfigDriver(base.BaseDeviceDriver):
 
     def __init__(self, device):
         super().__init__(device)
-        self.client = NetconfOpenConfigClient(device)
+        self.client = NetconfPicoClient(device)
         self.device = device
 
     def validate(self):
@@ -552,24 +552,50 @@ class NetconfOpenConfigDriver(base.BaseDeviceDriver):
         :param links: Local link information filtered for the device.
         """
         port = context.current
-        network = context.network.current
+        network = context.network.current  # Kept incase we need network logic
 
-        ifaces = interfaces.Interfaces()
+        admin_up = port["admin_state_up"]
+
+        if not switched_vlan:
+            LOG.debug("No VLAN, skipping Pica8 VLAN config.")
+            return
+
+        vlan_id = switched_vlan.config.access_vlan
+
+        # Build the Pica8 snippet:
+        # <config>
+        #   <interface xmlns="http://pica8.com/xorplus/interface">
+        #     <gigabit-ethernet>
+        #       <name>...</name>
+        #       <disable>false</disable>
+        #       <family>
+        #         <ethernet-switching>
+        #           <native-vlan-id>...</native-vlan-id>
+        #           <port-mode>access</port-mode>
+        #         </ethernet-switching>
+        #       </family>
+        #     </gigabit-ethernet>
+        #   </interface>
+        # </config>
+        
+        config_elem = ElementTree.Element("config")
         for link in links:
-            link_port_id = link.get(constants.PORT_ID)
+            link_port_id = link[constants.PORT_ID]
             link_port_id = self._port_id_resub(link_port_id)
 
-            iface = ifaces.add(link_port_id)
-            iface.config.enabled = port['admin_state_up']
-            if 'port_mtu' not in CONF[self.device].disabled_properties:
-                iface.config.mtu = network[api.MTU]
-            iface.config.description = f'neutron-{port[api.ID]}'
-            if switched_vlan is not None:
-                iface.ethernet.switched_vlan = switched_vlan
-            else:
-                del iface.ethernet
+            intf_elem = ElementTree.SubElement(config_elem, "interface")
+            intf_elem.set("xmlns", "http://pica8.com/xorplus/interface")
 
-        self.client.edit_config(ifaces)
+            ge_elem = ElementTree.SubElement(intf_elem, "gigabit-ethernet")
+            common.txt_subelement(ge_elem, "name", link_port_id)
+            common.txt_subelement(ge_elem, "disable", "false" if admin_up else "true")
+
+            family_elem = ElementTree.SubElement(ge_elem, "family")
+            eth_sw_elem = ElementTree.SubElement(family_elem, "ethernet-switching")
+            common.txt_subelement(eth_sw_elem, "native-vlan-id", str(vlan_id))
+            common.txt_subelement(eth_sw_elem, "port-mode", "access")
+
+        self.client.edit_config(config_elem)
 
     def create_lacp_aggregate(self, context, switched_vlan, links):
         """Create/Configure LACP aggregate on device
@@ -697,22 +723,23 @@ class NetconfOpenConfigDriver(base.BaseDeviceDriver):
             to the update_port call.
         :param links: Local link information filtered for the device.
         """
+        port = context.current # Kept incase we need port logic
         network = context.network.current
-        ifaces = interfaces.Interfaces()
-        port = context.current
 
-        for link in links:
-            link_port_id = link.get(constants.PORT_ID)
-            link_port_id = self._port_id_resub(link_port_id)
+        # Obtain VLAN ID from the network
+        segmentation_id = network.get(provider_net.SEGMENTATION_ID)
+        if not segmentation_id:
+            LOG.debug("No VLAN in update_non_bond, skipping.")
+            return
 
-            iface = ifaces.add(link_port_id)
-            iface.config.enabled = port['admin_state_up']
-            if 'port_mtu' not in CONF[self.device].disabled_properties:
-                iface.config.mtu = network[api.MTU]
+        # Rebuild a small switched_vlan just to reuse the .config.access_vlan field
+        switched_vlan = vlan.VlanSwitchedVlan()
+        switched_vlan.config.operation = nc_op.REPLACE
+        switched_vlan.config.interface_mode = constants.VLAN_MODE_ACCESS
+        switched_vlan.config.access_vlan = segmentation_id
 
-            del iface.ethernet
-
-        self.client.edit_config(ifaces)
+        # Reuse create_non_bond logic to apply Pica8 VLAN snippet
+        self.create_non_bond(context, switched_vlan, links)
 
     def update_lacp_aggregate(self, context, links):
         """Update LACP aggregate on device
@@ -803,26 +830,24 @@ class NetconfOpenConfigDriver(base.BaseDeviceDriver):
             to the update_port call.
         :param links: Local link information filtered for the device.
         """
-        network = context.network.current
-        ifaces = interfaces.Interfaces()
+        port = context.current # Kept incase we need port logic
+        network = context.network.current  # Kept incase we need network logic
+        config_elem = ElementTree.Element("config")
+
         for link in links:
-            link_port_id = link.get(constants.PORT_ID)
+            link_port_id = link[constants.PORT_ID]
             link_port_id = self._port_id_resub(link_port_id)
 
-            iface = ifaces.add(link_port_id)
-            iface.config.operation = nc_op.REMOVE
-            # Not possible mark entire config for removal due to name leaf-ref
-            # Set dummy values for properties to remove
-            iface.config.description = ''
-            iface.config.enabled = False
-            if 'port_mtu' not in CONF[self.device].disabled_properties:
-                iface.config.mtu = 0
-            if network[provider_net.NETWORK_TYPE] == n_const.TYPE_VLAN:
-                iface.ethernet.switched_vlan.config.operation = nc_op.REMOVE
-            else:
-                del iface.ethernet
+            intf_elem = ElementTree.SubElement(config_elem, "interface")
+            intf_elem.set("xmlns", "http://pica8.com/xorplus/interface")
 
-        self.client.edit_config(ifaces)
+            ge_elem = ElementTree.SubElement(intf_elem, "gigabit-ethernet")
+            common.txt_subelement(ge_elem, "name", link_port_id)
+            # For now, just disable the port
+            common.txt_subelement(ge_elem, "disable", "true")
+            # (If needed, you could also remove VLAN explicitly with an operation="delete".)
+
+        self.client.edit_config(config_elem)
 
     def delete_lacp_aggregate(self, context, links):
         """Delete/Un-configure LACP aggregate on device

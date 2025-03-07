@@ -76,10 +76,10 @@ XML_AGGREGATE_IFACES = f'''
 '''
 
 
-class TestNetconfOpenConfigClient(base.TestCase):
+class TestNetconfPicoClient(base.TestCase):
 
     def setUp(self):
-        super(TestNetconfOpenConfigClient, self).setUp()
+        super(TestNetconfPicoClient, self).setUp()
         self.device = 'foo'
         self.conf = self.useFixture(config_fixture.Config())
         self.conf.register_opts(config._opts + config._device_opts,
@@ -98,7 +98,7 @@ class TestNetconfOpenConfigClient(base.TestCase):
                          username='foo_user',
                          group='foo')
 
-        self.client = openconfig.NetconfOpenConfigClient(self.device)
+        self.client = openconfig.NetconfPicoClient(self.device)
 
     def test_get_lock_session_id(self):
         err_info = (
@@ -145,7 +145,7 @@ class TestNetconfOpenConfigClient(base.TestCase):
             self.client.get_capabilities())
 
     @mock.patch.object(manager, 'connect', autospec=True)
-    @mock.patch.object(openconfig.NetconfOpenConfigClient,
+    @mock.patch.object(openconfig.NetconfPicoClient,
                        'get_lock_and_configure', autospec=True)
     def test_edit_config_writable_running(self, mock_lock_config,
                                           mock_manager):
@@ -161,7 +161,7 @@ class TestNetconfOpenConfigClient(base.TestCase):
                                                  [fake_config], False)
 
     @mock.patch.object(manager, 'connect', autospec=True)
-    @mock.patch.object(openconfig.NetconfOpenConfigClient,
+    @mock.patch.object(openconfig.NetconfPicoClient,
                        'get_lock_and_configure', autospec=True)
     def test_edit_config_candidate(self, mock_lock_config, mock_manager):
         fake_config = mock.Mock()
@@ -309,7 +309,7 @@ class TestNetconfOpenConfigDriver(base.TestCase):
                          key_filename='/test/test_key_file',
                          username='foo_user',
                          group='foo')
-        mock_client = mock.patch.object(openconfig, 'NetconfOpenConfigClient',
+        mock_client = mock.patch.object(openconfig, 'NetconfPicoClient',
                                         autospec=True)
         self.mock_client = mock_client.start()
         self.addCleanup(mock_client.stop)
@@ -434,43 +434,68 @@ class TestNetconfOpenConfigDriver(base.TestCase):
                 self.assertEqual(vlan.config.name, 'neutron-DELETED-15')
 
     def test_create_port_vlan(self):
+        """Verify that creating a VLAN port produces the Pica8 <config> snippet."""
+        # 1) Set up the mock NetworkContext and PortContext as before:
         tenant_id = uuidutils.generate_uuid()
         network_id = uuidutils.generate_uuid()
         project_id = uuidutils.generate_uuid()
+
+        # Mock a VLAN network
         m_nc = mock.create_autospec(driver_context.NetworkContext)
-        m_pc = mock.create_autospec(driver_context.PortContext)
         m_nc.current = ml2_utils.get_test_network(
             id=network_id, tenant_id=tenant_id, project_id=project_id,
-            network_type=n_const.TYPE_VLAN, segmentation_id=15)
+            network_type=n_const.TYPE_VLAN, segmentation_id=15
+        )
+
+        # Mock a port on that VLAN network
+        m_pc = mock.create_autospec(driver_context.PortContext)
         m_pc.current = ml2_utils.get_test_port(
-            network_id=network_id, tenant_id=tenant_id, project_id=project_id)
+            network_id=network_id, tenant_id=tenant_id, project_id=project_id
+        )
+        # Link the port to the network
         m_pc.network = m_nc
+
+        # Build the segment and links as done in the original code
         segment = {
             api.ID: uuidutils.generate_uuid(),
-            api.PHYSICAL_NETWORK:
-                m_nc.current['provider:physical_network'],
+            api.PHYSICAL_NETWORK: m_nc.current['provider:physical_network'],
             api.NETWORK_TYPE: m_nc.current['provider:network_type'],
-            api.SEGMENTATION_ID: m_nc.current['provider:segmentation_id']}
+            api.SEGMENTATION_ID: m_nc.current['provider:segmentation_id']
+        }
         links = m_pc.current['binding:profile'][constants.LOCAL_LINK_INFO]
+
+        # 2) Call create_port in your new Pica8 driver
         self.driver.create_port(m_pc, segment, links)
+
+        # 3) Check what edit_config was called with
         self.driver.client.edit_config.assert_called_once()
         call_args_list = self.driver.client.edit_config.call_args_list
-        ifaces = call_args_list[0][0][0]
-        for iface in ifaces:
-            self.assertEqual(iface.name, links[0]['port_id'])
-            self.assertEqual(iface.config.enabled,
-                             m_pc.current['admin_state_up'])
-            self.assertEqual(iface.config.mtu, m_nc.current[api.MTU])
-            self.assertEqual(iface.config.description,
-                             f'neutron-{m_pc.current[api.ID]}')
-            self.assertEqual(iface.ethernet.switched_vlan.config.operation,
-                             nc_op.REPLACE.value)
-            self.assertEqual(
-                iface.ethernet.switched_vlan.config.interface_mode,
-                constants.VLAN_MODE_ACCESS)
-            self.assertEqual(
-                iface.ethernet.switched_vlan.config.access_vlan,
-                segment[api.SEGMENTATION_ID])
+
+        # The first positional argument to edit_config is the ElementTree root:
+        config_elem = call_args_list[0][0][0]
+
+        # Convert it to a string for easy checks:
+        xml_str = ElementTree.tostring(config_elem, encoding='unicode')
+
+        # 4) Assert that we produced <config> as the root
+        self.assertEqual("config", config_elem.tag)
+
+        # 5) Assert we used the Pica8 namespace
+        self.assertIn('http://pica8.com/xorplus/interface', xml_str)
+
+        # 6) Check that we used the expected VLAN ID in <native-vlan-id>
+        expected_vlan = segment[api.SEGMENTATION_ID]
+        self.assertIn(f"<native-vlan-id>{expected_vlan}</native-vlan-id>", xml_str)
+
+        # 7) Check we set <port-mode>access
+        self.assertIn("<port-mode>access</port-mode>", xml_str)
+
+        # 8) Check <disable> false/true, depending on admin_state_up
+        admin_up = m_pc.current['admin_state_up']
+        disable_str = "<disable>true</disable>" if not admin_up else "<disable>false</disable>"
+        self.assertIn(disable_str, xml_str)
+
+        # That's enough to confirm the Pica8 VLAN snippet was produced correctly.
 
     def test_create_port_flat(self):
         tenant_id = uuidutils.generate_uuid()
