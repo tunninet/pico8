@@ -10,9 +10,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import eventlet
-eventlet.monkey_patch()
-
 import warnings
 
 from unittest import mock
@@ -83,12 +80,6 @@ XML_AGGREGATE_IFACES = f'''
 class TestNetconfPicoClient(base.TestCase):
 
     def setUp(self):
-        warnings.filterwarnings("ignore", category=DeprecationWarning, module="oslo_messaging")
-        warnings.filterwarnings("ignore", category=DeprecationWarning, module="oslo_cache")
-        warnings.filterwarnings("ignore", category=DeprecationWarning, module="tooz")
-        # You might need to add more modules here, depending on where the warnings originate.
-        # You can even filter by message:
-        warnings.filterwarnings("ignore", message="Eventlet support is deprecated")
         super(TestNetconfPicoClient, self).setUp()
         self.device = 'foo'
         self.conf = self.useFixture(config_fixture.Config())
