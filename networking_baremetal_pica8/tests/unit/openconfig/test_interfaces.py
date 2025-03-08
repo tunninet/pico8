@@ -35,7 +35,7 @@ class TestInterfaces(base.BaseTestCase):
         element = if_eth.to_xml_element()
         xml_str = ElementTree.tostring(element).decode("utf-8")
         expected = (f'<ethernet xmlns="{if_eth.NAMESPACE}">'
-                    '<fake-ethernet-conf />'
+                    '<fake-ethernet-config />'
                     '<fake-switched-vlan />'
                     '</ethernet>')
         self.assertEqual(expected, xml_str)

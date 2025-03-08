@@ -543,58 +543,46 @@ class NetconfOpenConfigDriver(base.BaseDeviceDriver):
             self.create_pre_conf_aggregate(context, switched_vlan, links)
 
     def create_non_bond(self, context, switched_vlan, links):
-        """Create/Configure ports on device
+        """
+        Create/Configure ports on device.
 
-        :param context: PortContext instance describing the new
-            state of the port, as well as the original state prior
-            to the update_port call.
-        :param switched_vlan: switched_vlan OpenConfig object
-        :param links: Local link information filtered for the device.
+        Here we produce a Pica8 XML snippet for non-bond ports.
+        For each link we generate:
+        <interface xmlns="http://pica8.com/xorplus/interface">
+            <gigabit-ethernet>
+            <name>{port_id}</name>
+            <disable>{ "false" if admin_up else "true" }</disable>
+            [if VLAN:]
+            <family>
+                <ethernet-switching>
+                <native-vlan-id>{vlan_id}</native-vlan-id>
+                <port-mode>access</port-mode>
+                </ethernet-switching>
+            </family>
+            </gigabit-ethernet>
+        </interface>
+        All these are wrapped inside a top-level <config> element.
         """
         port = context.current
-        network = context.network.current  # Kept incase we need network logic
-
         admin_up = port["admin_state_up"]
-
-        if not switched_vlan:
-            LOG.debug("No VLAN, skipping Pica8 VLAN config.")
-            return
-
-        vlan_id = switched_vlan.config.access_vlan
-
-        # Build the Pica8 snippet:
-        # <config>
-        #   <interface xmlns="http://pica8.com/xorplus/interface">
-        #     <gigabit-ethernet>
-        #       <name>...</name>
-        #       <disable>false</disable>
-        #       <family>
-        #         <ethernet-switching>
-        #           <native-vlan-id>...</native-vlan-id>
-        #           <port-mode>access</port-mode>
-        #         </ethernet-switching>
-        #       </family>
-        #     </gigabit-ethernet>
-        #   </interface>
-        # </config>
-        
         config_elem = ElementTree.Element("config")
         for link in links:
-            link_port_id = link[constants.PORT_ID]
+            link_port_id = link.get(constants.PORT_ID)
             link_port_id = self._port_id_resub(link_port_id)
-
-            intf_elem = ElementTree.SubElement(config_elem, "interface")
-            intf_elem.set("xmlns", "http://pica8.com/xorplus/interface")
-
+            intf_elem = ElementTree.SubElement(
+                config_elem,
+                "interface",
+                xmlns="http://pica8.com/xorplus/interface"
+            )
             ge_elem = ElementTree.SubElement(intf_elem, "gigabit-ethernet")
             common.txt_subelement(ge_elem, "name", link_port_id)
             common.txt_subelement(ge_elem, "disable", "false" if admin_up else "true")
-
-            family_elem = ElementTree.SubElement(ge_elem, "family")
-            eth_sw_elem = ElementTree.SubElement(family_elem, "ethernet-switching")
-            common.txt_subelement(eth_sw_elem, "native-vlan-id", str(vlan_id))
-            common.txt_subelement(eth_sw_elem, "port-mode", "access")
-
+            if switched_vlan:
+                vlan_id = switched_vlan.config.access_vlan
+                family_elem = ElementTree.SubElement(ge_elem, "family")
+                eth_sw = ElementTree.SubElement(family_elem, "ethernet-switching")
+                common.txt_subelement(eth_sw, "native-vlan-id", str(vlan_id))
+                common.txt_subelement(eth_sw, "port-mode", "access")
         self.client.edit_config(config_elem)
 
     def create_lacp_aggregate(self, context, switched_vlan, links):
@@ -716,30 +704,48 @@ class NetconfOpenConfigDriver(base.BaseDeviceDriver):
             self.update_pre_conf_aggregate(context, links)
 
     def update_non_bond(self, context, links):
-        """Update port on device
-
-        :param context: PortContext instance describing the new
-            state of the port, as well as the original state prior
-            to the update_port call.
-        :param links: Local link information filtered for the device.
         """
-        port = context.current # Kept incase we need port logic
-        network = context.network.current
+        Update port on device.
 
-        # Obtain VLAN ID from the network
-        segmentation_id = network.get(provider_net.SEGMENTATION_ID)
-        if not segmentation_id:
-            LOG.debug("No VLAN in update_non_bond, skipping.")
-            return
+        This implementation simply rebuilds the configuration in the same way
+        as create_non_bond. (If needed, you could compare current vs. desired and
+        avoid reapplying unchanged settings.)
+        """
+        port = context.current
+        admin_up = port["admin_state_up"]
 
-        # Rebuild a small switched_vlan just to reuse the .config.access_vlan field
-        switched_vlan = vlan.VlanSwitchedVlan()
-        switched_vlan.config.operation = nc_op.REPLACE
-        switched_vlan.config.interface_mode = constants.VLAN_MODE_ACCESS
-        switched_vlan.config.access_vlan = segmentation_id
+        # If this is a VLAN network, assume we want to update the VLAN info.
+        # (Here we build a dummy switched_vlan for simplicity.)
+        if port.get('provider:network_type') == n_const.TYPE_VLAN:
+            vlan_id = port.get('provider:segmentation_id')
+            # Create a fake object with a 'config.access_vlan' attribute.
+            class Dummy:
+                pass
+            dummy_conf = Dummy()
+            dummy_conf.access_vlan = vlan_id
+            switched_vlan = Dummy()
+            switched_vlan.config = dummy_conf
+        else:
+            switched_vlan = None
 
-        # Reuse create_non_bond logic to apply Pica8 VLAN snippet
-        self.create_non_bond(context, switched_vlan, links)
+        config_elem = ElementTree.Element("config")
+        for link in links:
+            link_port_id = link.get(constants.PORT_ID)
+            link_port_id = self._port_id_resub(link_port_id)
+            intf_elem = ElementTree.SubElement(
+                config_elem,
+                "interface",
+                xmlns="http://pica8.com/xorplus/interface"
+            )
+            ge_elem = ElementTree.SubElement(intf_elem, "gigabit-ethernet")
+            common.txt_subelement(ge_elem, "name", link_port_id)
+            common.txt_subelement(ge_elem, "disable", "false" if admin_up else "true")
+            if switched_vlan:
+                family_elem = ElementTree.SubElement(ge_elem, "family")
+                eth_sw = ElementTree.SubElement(family_elem, "ethernet-switching")
+                common.txt_subelement(eth_sw, "native-vlan-id", str(switched_vlan.config.access_vlan))
+                common.txt_subelement(eth_sw, "port-mode", "access")
+        self.client.edit_config(config_elem)
 
     def update_lacp_aggregate(self, context, links):
         """Update LACP aggregate on device
@@ -797,21 +803,23 @@ class NetconfOpenConfigDriver(base.BaseDeviceDriver):
         self.client.edit_config(ifaces)
 
     def delete_port(self, context, links, current=True):
-        """Delete/Un-configure port on device
-
-        :param context: PortContext instance describing the new
-            state of the port, as well as the original state prior
-            to the update_port call.
-        :param links: Local link information filtered for the device.
-        :param current: Boolean, when true use context.current, when
-            false use context.original
         """
-        port = context.current if current else context.original
-        binding_profile = port[portbindings.PROFILE]
-        local_group_information = binding_profile.get(
-            constants.LOCAL_GROUP_INFO, {})
-        bond_mode = local_group_information.get('bond_mode')
+        Delete/Un-configure a port on the device.
 
+        :param context: PortContext instance containing both current and
+                        original state.
+        :param links: Local link information filtered for this device.
+        :param current: When True, use context.current; otherwise, context.original.
+        """
+        # Determine which port state to use
+        port = context.current if current else context.original
+
+        # Extract the binding profile and bond mode (if any)
+        binding_profile = port.get("binding:profile", {})
+        local_group_info = binding_profile.get(constants.LOCAL_GROUP_INFO, {})
+        bond_mode = local_group_info.get("bond_mode")
+
+        # Branch based on the bond mode
         if not bond_mode or bond_mode in constants.NON_SWITCH_BOND_MODES:
             self.delete_non_bond(context, links)
         elif bond_mode in constants.LACP_BOND_MODES:
@@ -823,30 +831,47 @@ class NetconfOpenConfigDriver(base.BaseDeviceDriver):
             self.delete_pre_conf_aggregate(links)
 
     def delete_non_bond(self, context, links):
-        """Delete/Un-configure port on device
-
-        :param context: PortContext instance describing the new
-            state of the port, as well as the original state prior
-            to the update_port call.
-        :param links: Local link information filtered for the device.
         """
-        port = context.current # Kept incase we need port logic
-        network = context.network.current  # Kept incase we need network logic
+        Delete/Un-configure a non-bond port on the device using a Pica8 XML snippet.
+
+        This function produces an XML configuration with operation="remove" that
+        includes the necessary configuration for both flat and VLAN ports. In the VLAN
+        case the configuration includes the <family>/<ethernet-switching> block with
+        <port-mode>access</port-mode>.
+
+        :param context: PortContext instance describing the current port state.
+        :param links: List of local link dictionaries for the device.
+        """
+        from xml.etree import ElementTree
+        from networking_baremetal_pica8 import common
+        from neutron_lib import constants as n_const
+
+        # Create the root <config> element.
         config_elem = ElementTree.Element("config")
 
         for link in links:
-            link_port_id = link[constants.PORT_ID]
+            # Use the literal "port_id" key instead of common.PORT_ID.
+            link_port_id = link.get(constants.PORT_ID)
             link_port_id = self._port_id_resub(link_port_id)
 
+            # Create the <interface> element in the Pica8 namespace and mark it for removal.
             intf_elem = ElementTree.SubElement(config_elem, "interface")
             intf_elem.set("xmlns", "http://pica8.com/xorplus/interface")
+            intf_elem.set("operation", "remove")
 
+            # Build the <gigabit-ethernet> element.
             ge_elem = ElementTree.SubElement(intf_elem, "gigabit-ethernet")
             common.txt_subelement(ge_elem, "name", link_port_id)
-            # For now, just disable the port
+            # For deletion, explicitly disable the interface.
             common.txt_subelement(ge_elem, "disable", "true")
-            # (If needed, you could also remove VLAN explicitly with an operation="delete".)
 
+            # If this port is associated with a VLAN network, add the ethernet-switching block.
+            if context.network.current.get("provider:network_type") == n_const.TYPE_VLAN:
+                family_elem = ElementTree.SubElement(ge_elem, "family")
+                eth_sw_elem = ElementTree.SubElement(family_elem, "ethernet-switching")
+                common.txt_subelement(eth_sw_elem, "port-mode", "access")
+
+        # Send the configuration to the device.
         self.client.edit_config(config_elem)
 
     def delete_lacp_aggregate(self, context, links):
