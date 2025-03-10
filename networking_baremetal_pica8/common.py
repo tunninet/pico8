@@ -34,7 +34,14 @@ def txt_subelement(parent, tag, text, *args, **kwargs):
 def config_to_xml(config):
     element = ElementTree.Element(constants.CFG_ELEMENT)
     for conf in config:
-        element.append(conf.to_xml_element())
+        if hasattr(conf, 'to_xml_element'):
+            xml_conf = conf.to_xml_element()
+        elif isinstance(conf, ElementTree.Element):
+            xml_conf = conf
+        else:
+            raise exceptions.ConfigurationError(
+                "Configuration object must be an XML Element or implement to_xml_element()")
+        element.append(xml_conf)
     return ElementTree.tostring(element).decode("utf-8")
 
 
