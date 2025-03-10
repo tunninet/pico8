@@ -32,6 +32,14 @@ def txt_subelement(parent, tag, text, *args, **kwargs):
 
 
 def config_to_xml(config):
+    # If config is a list with a single element that is already the top-level config,
+    # then just convert it to a string directly.
+    if (isinstance(config, list) and len(config) == 1 and
+            isinstance(config[0], ElementTree.Element) and
+            config[0].tag == constants.CFG_ELEMENT):
+        return ElementTree.tostring(config[0]).decode("utf-8")
+
+    # Otherwise, create a new top-level element.
     element = ElementTree.Element(constants.CFG_ELEMENT)
     for conf in config:
         if hasattr(conf, 'to_xml_element'):
@@ -40,9 +48,11 @@ def config_to_xml(config):
             xml_conf = conf
         else:
             raise exceptions.ConfigurationError(
-                "Configuration object must be an XML Element or implement to_xml_element()")
+                "Configuration object must be an XML Element or implement to_xml_element()"
+            )
         element.append(xml_conf)
     return ElementTree.tostring(element).decode("utf-8")
+
 
 
 def driver_mgr(device_id):
