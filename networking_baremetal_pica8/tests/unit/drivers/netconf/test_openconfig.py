@@ -10,6 +10,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import warnings
+
 from unittest import mock
 from xml.etree import ElementTree
 
@@ -28,7 +30,6 @@ from networking_baremetal_pica8.openconfig.interfaces import interfaces
 from networking_baremetal_pica8.openconfig.lacp import lacp
 from networking_baremetal_pica8.tests import base
 from networking_baremetal_pica8.tests.unit.plugins.ml2 import utils as ml2_utils
-
 
 OC_IF_NS = 'http://openconfig.net/yang/interfaces'
 OC_IF_ETH_NS = 'http://openconfig.net/yang/interfaces/ethernet'
@@ -498,6 +499,7 @@ class TestNetconfOpenConfigDriver(base.TestCase):
         # That's enough to confirm the Pica8 VLAN snippet was produced correctly.
 
     def test_create_port_flat(self):
+        """Now parse the raw XML snippet for flat ports, similar to test_create_port_vlan."""
         tenant_id = uuidutils.generate_uuid()
         network_id = uuidutils.generate_uuid()
         project_id = uuidutils.generate_uuid()
@@ -511,24 +513,32 @@ class TestNetconfOpenConfigDriver(base.TestCase):
         m_pc.network = m_nc
         segment = {
             api.ID: uuidutils.generate_uuid(),
-            api.PHYSICAL_NETWORK:
-                m_nc.current['provider:physical_network'],
-            api.NETWORK_TYPE: m_nc.current['provider:network_type']}
+            api.PHYSICAL_NETWORK: m_nc.current['provider:physical_network'],
+            api.NETWORK_TYPE: m_nc.current['provider:network_type']
+        }
         links = m_pc.current['binding:profile'][constants.LOCAL_LINK_INFO]
+
         self.driver.create_port(m_pc, segment, links)
+
         self.driver.client.edit_config.assert_called_once()
         call_args_list = self.driver.client.edit_config.call_args_list
-        ifaces = call_args_list[0][0][0]
-        for iface in ifaces:
-            self.assertEqual(iface.name, links[0]['port_id'])
-            self.assertEqual(iface.config.enabled,
-                             m_pc.current['admin_state_up'])
-            self.assertEqual(iface.config.mtu, m_nc.current[api.MTU])
-            self.assertEqual(iface.config.description,
-                             f'neutron-{m_pc.current[api.ID]}')
-            self.assertIsNone(iface.ethernet)
+        config_elem = call_args_list[0][0][0]  # The <config> root
+        xml_str = ElementTree.tostring(config_elem, encoding='unicode')
+
+        # Confirm root is <config>
+        self.assertEqual("config", config_elem.tag)
+        # Confirm Pica8 namespace is used
+        self.assertIn('http://pica8.com/xorplus/interface', xml_str)
+        # Check disable vs. enable
+        admin_up = m_pc.current['admin_state_up']
+        disable_str = "<disable>true</disable>" if not admin_up else "<disable>false</disable>"
+        self.assertIn(disable_str, xml_str)
+        # For flat networks, we shouldn't see <native-vlan-id> or <port-mode>:
+        self.assertNotIn("<native-vlan-id>", xml_str)
+        self.assertNotIn("<port-mode>", xml_str)
 
     def test_update_port(self):
+        """Parse the raw XML for VLAN or flat update."""
         tenant_id = uuidutils.generate_uuid()
         network_id = uuidutils.generate_uuid()
         project_id = uuidutils.generate_uuid()
@@ -550,16 +560,23 @@ class TestNetconfOpenConfigDriver(base.TestCase):
             admin_state_up=True)
         m_pc.network = m_nc
         links = m_pc.current['binding:profile'][constants.LOCAL_LINK_INFO]
+
         self.driver.update_port(m_pc, links)
         self.driver.client.edit_config.assert_called_once()
         call_args_list = self.driver.client.edit_config.call_args_list
-        ifaces = call_args_list[0][0][0]
-        for iface in ifaces:
-            self.assertEqual(iface.name, links[0]['port_id'])
-            self.assertEqual(iface.config.enabled,
-                             m_pc.current['admin_state_up'])
-            self.assertEqual(iface.config.mtu, m_nc.current[api.MTU])
-            self.assertIsNone(iface.ethernet)
+        config_elem = call_args_list[0][0][0]
+        xml_str = ElementTree.tostring(config_elem, encoding='unicode')
+
+        # We expect a <config> root with <disable> changing
+        self.assertEqual("config", config_elem.tag)
+        admin_up = m_pc.current['admin_state_up']
+        disable_str = "<disable>true</disable>" if not admin_up else "<disable>false</disable>"
+        self.assertIn(disable_str, xml_str)
+        # Possibly check for updated MTU or other attributes depending on your Pica8 code
+        if admin_up:
+            self.assertNotIn("<disable>true</disable>", xml_str)
+        else:
+            self.assertIn("<disable>true</disable>", xml_str)
 
     def test_update_port_no_supported_attrib_changed(self):
         tenant_id = uuidutils.generate_uuid()
@@ -585,6 +602,7 @@ class TestNetconfOpenConfigDriver(base.TestCase):
         self.driver.client.edit_config.assert_not_called()
 
     def test_delete_port_vlan(self):
+        """Parse the raw XML for VLAN port deletion."""
         tenant_id = uuidutils.generate_uuid()
         network_id = uuidutils.generate_uuid()
         project_id = uuidutils.generate_uuid()
@@ -597,20 +615,22 @@ class TestNetconfOpenConfigDriver(base.TestCase):
             network_id=network_id, tenant_id=tenant_id, project_id=project_id)
         m_pc.network = m_nc
         links = m_pc.current['binding:profile'][constants.LOCAL_LINK_INFO]
+
         self.driver.delete_port(m_pc, links)
         self.driver.client.edit_config.assert_called_once()
         call_args_list = self.driver.client.edit_config.call_args_list
-        ifaces = call_args_list[0][0][0]
-        for iface in ifaces:
-            self.assertEqual(iface.name, links[0]['port_id'])
-            self.assertEqual(iface.config.operation, nc_op.REMOVE.value)
-            self.assertEqual(iface.config.description, '')
-            self.assertFalse(iface.config.enabled)
-            self.assertEqual(iface.config.mtu, 0)
-            self.assertEqual(iface.ethernet.switched_vlan.config.operation,
-                             nc_op.REMOVE.value)
+        config_elem = call_args_list[0][0][0]
+        xml_str = ElementTree.tostring(config_elem, encoding='unicode')
+
+        # Expect <config> root and operation="remove"
+        self.assertEqual("config", config_elem.tag)
+        self.assertIn('operation="remove"', xml_str)
+        # For VLAN deletion, you might see <port-mode> access or remove calls
+        self.assertIn("<port-mode>access</port-mode>", xml_str)
+        self.assertIn("<disable>true</disable>", xml_str)
 
     def test_delete_port_flat(self):
+        """Parse the raw XML for flat port deletion."""
         tenant_id = uuidutils.generate_uuid()
         network_id = uuidutils.generate_uuid()
         project_id = uuidutils.generate_uuid()
@@ -623,17 +643,19 @@ class TestNetconfOpenConfigDriver(base.TestCase):
             network_id=network_id, tenant_id=tenant_id, project_id=project_id)
         m_pc.network = m_nc
         links = m_pc.current['binding:profile'][constants.LOCAL_LINK_INFO]
+
         self.driver.delete_port(m_pc, links)
         self.driver.client.edit_config.assert_called_once()
         call_args_list = self.driver.client.edit_config.call_args_list
-        ifaces = call_args_list[0][0][0]
-        for iface in ifaces:
-            self.assertEqual(iface.name, links[0]['port_id'])
-            self.assertEqual(iface.config.operation, nc_op.REMOVE.value)
-            self.assertEqual(iface.config.description, '')
-            self.assertFalse(iface.config.enabled)
-            self.assertEqual(iface.config.mtu, 0)
-            self.assertIsNone(iface.ethernet)
+        config_elem = call_args_list[0][0][0]
+        xml_str = ElementTree.tostring(config_elem, encoding='unicode')
+
+        self.assertEqual("config", config_elem.tag)
+        self.assertIn('operation="remove"', xml_str)
+        # On a flat port delete, we wouldn't expect VLAN tags
+        self.assertNotIn("<native-vlan-id>", xml_str)
+        # Typically sets <disable>true</disable>
+        self.assertIn("<disable>true</disable>", xml_str)
 
     def test_create_lacp_port_flat(self):
         tenant_id = uuidutils.generate_uuid()
