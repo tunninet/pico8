@@ -278,7 +278,7 @@ class NetconfPicoClient(object):
                     caps.add(k)
             if cap.startswith('http://openconfig.net/yang'):
                 parsed = urlparse(cap)
-                qs = parse_qs(parsed.query)
+                qs = urlparse_qs(parsed.query)
                 if 'module' in qs:
                     caps.add(qs['module'][0])
         return caps
