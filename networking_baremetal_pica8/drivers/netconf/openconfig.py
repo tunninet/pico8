@@ -16,7 +16,7 @@ import re
 import uuid
 import random
 from urllib.parse import urlparse, parse_qs as urlparse_qs
-from xml.etree import ElementTree
+import xml.etree.ElementTree as ET
 
 from ncclient import manager
 from ncclient.operations.rpc import RPCError
@@ -108,6 +108,7 @@ _NCCLIENT_OPTS = [
 
 CONF = cfg.CONF
 
+
 def force_config_none(iface):
     object.__setattr__(iface, '_config', None)
     if hasattr(iface.__class__, 'config'):
@@ -117,18 +118,17 @@ def force_config_none(iface):
                 return None
         iface.__class__ = _NoConfigClass
 
+
 def config_to_xml(config_list):
-    root = ElementTree.Element("config")
+    root = ET.Element("config")
     for cfg_obj in config_list:
         root.append(cfg_obj.to_xml_element())
     return root
 
+
 common.config_to_xml = config_to_xml
 
 
-#
-# ESI-lag Collision detection logic
-#
 def _increment_mac(mac_str: str) -> str:
     """
     Given a MAC like '44:AA:BB:CC:DD:EE', increment by 1 in hex, return next MAC.
@@ -149,6 +149,7 @@ def _increment_mac(mac_str: str) -> str:
         new_parts.append(f"{octet:02X}")
     return ":".join(new_parts)
 
+
 def _fetch_existing_esi_data(client_locked) -> set:
     """
     Queries aggregator interfaces from device config, extracting any <evpn><mh> (es-id, es-sys-mac).
@@ -161,7 +162,7 @@ def _fetch_existing_esi_data(client_locked) -> set:
 
     reply = client_locked.get(query=query_ifaces)
     data_str = getattr(reply, 'data_xml', '') or '<data/>'
-    root = ElementTree.fromstring(data_str)
+    root = ET.fromstring(data_str)
 
     existing = set()
     ns = query_ifaces.NAMESPACE  # "http://openconfig.net/yang/interfaces"
@@ -182,6 +183,7 @@ def _fetch_existing_esi_data(client_locked) -> set:
                         pass
     return existing
 
+
 def get_unique_esi_lag(client_locked,
                        desired_es_id: int = None,
                        desired_es_mac: str = None,
@@ -193,7 +195,6 @@ def get_unique_esi_lag(client_locked,
       1) If operator sets (desired_es_id, desired_es_mac):
          - If already in use => log that we are "joining" aggregator
          - Else => log we create aggregator with that ID
-         Return them
       2) Otherwise, increment from base_es_id/base_es_mac until we find free pair
          or run out of attempts.
     """
@@ -203,9 +204,13 @@ def get_unique_esi_lag(client_locked,
         es_id = desired_es_id
         es_mac = desired_es_mac.strip().upper()
         if (es_id, es_mac) in existing:
-            LOG.info(f"User-supplied ESI-lag (es_id={es_id}, mac={es_mac}) is already in use; joining aggregator.")
+            LOG.info(
+                f"User-supplied ESI-lag (es_id={es_id}, mac={es_mac}) is already in use; joining aggregator."
+            )
         else:
-            LOG.info(f"User-supplied ESI-lag (es_id={es_id}, mac={es_mac}) is not in use; creating aggregator.")
+            LOG.info(
+                f"User-supplied ESI-lag (es_id={es_id}, mac={es_mac}) is not in use; creating aggregator."
+            )
         return (es_id, es_mac)
 
     # else auto-generate
@@ -213,20 +218,19 @@ def get_unique_esi_lag(client_locked,
     es_mac = base_es_mac.strip().upper()
     for attempt in range(max_attempts):
         if (es_id, es_mac) not in existing:
-            LOG.info(f"Auto-generated new unique ESI-lag: es_id={es_id}, es_mac={es_mac}")
+            LOG.info(
+                f"Auto-generated new unique ESI-lag: es_id={es_id}, es_mac={es_mac}"
+            )
             return (es_id, es_mac)
         # increment
         es_id += 1
         es_mac = _increment_mac(es_mac)
 
     raise exceptions.DriverError(
-        f"Could not find a free ESI-lag after {max_attempts} attempts. Last tried (es_id={es_id}, mac={es_mac})."
+        f"Could not find a free ESI-lag after {max_attempts} attempts. "
+        f"Last tried (es_id={es_id}, mac={es_mac})."
     )
 
-
-#################################
-# The main driver code
-#################################
 
 class NetconfPicoClient(object):
     def __init__(self, device):
@@ -275,14 +279,14 @@ class NetconfPicoClient(object):
         """
         Typically tested by test_get_lock_session_id
         """
-        root = ElementTree.fromstring(err_info)
+        root = ET.fromstring(err_info)
         sid_elem = root.find("./{urn:ietf:params:xml:ns:netconf:base:1.0}session-id")
         return sid_elem.text if sid_elem is not None else '0'
 
     def get(self, **kwargs):
         if 'query' in kwargs and kwargs['query'] is not None:
             query_obj = kwargs['query']
-            q_filter = ElementTree.tostring(query_obj.to_xml_element()).decode('utf-8')
+            q_filter = ET.tostring(query_obj.to_xml_element()).decode('utf-8')
             with manager.connect(**self.get_client_args()) as nc_client:
                 return nc_client.get(filter=('subtree', q_filter))
         elif 'filter' in kwargs and kwargs['filter'] is not None:
@@ -306,7 +310,7 @@ class NetconfPicoClient(object):
             if deferred_allocations:
                 agg_id = self.get_free_aggregate_id(client)
                 self.allocate_deferred(agg_id, config_objs)
-            xml_conf = ElementTree.tostring(config_to_xml(config_objs), encoding='unicode')
+            xml_conf = ET.tostring(config_to_xml(config_objs), encoding='unicode')
             if source == 'candidate':
                 client.discard_changes()
                 client.edit_config(target='candidate', config=xml_conf)
@@ -352,10 +356,10 @@ class NetconfPicoClient(object):
             return "Po10"
         oc_ifaces = Interfaces()
         oc_ifaces.add("", interface_type=constants.IFACE_TYPE_BASE)
-        filter_str = ElementTree.tostring(oc_ifaces.to_xml_element(), encoding='unicode')
+        filter_str = ET.tostring(oc_ifaces.to_xml_element(), encoding='unicode')
         reply = client_locked.get(filter=('subtree', filter_str))
         xml_str = getattr(reply, 'data_xml', '') or '<data/>'
-        root = ElementTree.fromstring(xml_str)
+        root = ET.fromstring(xml_str)
         used = set()
         ns = oc_ifaces.NAMESPACE
         for nm in root.findall(f".//{{{ns}}}name"):
@@ -366,6 +370,40 @@ class NetconfPicoClient(object):
             return "Po10"
         return free[0]
 
+    def get_switch_info(self):
+        """
+        Attempt to retrieve basic system info from the device via the
+        'system' container in 'http://pica8.com/xorplus/system'. Then log it.
+        """
+        system_elem = ET.Element("system", xmlns="http://pica8.com/xorplus/system")
+        reply = self.get(query=system_elem)
+        if not reply:
+            LOG.warning("No reply from device when fetching <system> info.")
+            return
+
+        data_xml = getattr(reply, 'data_xml', '') or ''
+        root = ET.fromstring(data_xml)
+
+        # Usually found under <system>
+        ns = "http://pica8.com/xorplus/system"
+        system_node = root.find(f".//{{{ns}}}system")
+        if not system_node:
+            LOG.warning("No <system> node found, cannot parse system info.")
+            return
+
+        hostname_el = system_node.find(f".//{{{ns}}}host-name")
+        version_el  = system_node.find(f".//{{{ns}}}version")
+        model_el    = system_node.find(f".//{{{ns}}}model")
+
+        hostname = hostname_el.text if hostname_el is not None else "UNKNOWN"
+        version  = version_el.text  if version_el  is not None else "UNKNOWN"
+        model    = model_el.text    if model_el    is not None else "UNKNOWN"
+
+        LOG.info(
+            "Connected to Pica8 switch '%s' (model=%s, version=%s)",
+            hostname, model, version
+        )
+
 
 class NetconfOpenConfigDriver(object):
     def __init__(self, device):
@@ -374,6 +412,8 @@ class NetconfOpenConfigDriver(object):
 
     def validate(self):
         self.client.get_capabilities()
+        # Optionally fetch & log system info here:
+        self.client.get_switch_info()
 
     def load_config(self):
         CONF.register_opts(_DEVICE_OPTS, group=self.device)
@@ -408,17 +448,17 @@ class NetconfOpenConfigDriver(object):
 
     def _append_vni_config(self, net_instances, seg_id, remove=False):
         root_el = net_instances.to_xml_element()
-        vx_el = ElementTree.SubElement(root_el, "vxlans", xmlns="http://pica8.com/xorplus/vxlans")
-        vni_el = ElementTree.SubElement(vx_el, "vni")
+        vx_el = ET.SubElement(root_el, "vxlans", xmlns="http://pica8.com/xorplus/vxlans")
+        vni_el = ET.SubElement(vx_el, "vni")
         op_str = nc_op.REMOVE.value if remove else nc_op.MERGE.value
         vni_el.set("operation", op_str)
-        id_el = ElementTree.SubElement(vni_el, "id")
+        id_el = ET.SubElement(vni_el, "id")
         id_el.text = str(100000 + seg_id)
         if not remove:
-            decap = ElementTree.SubElement(vni_el, "decapsulation")
-            mode = ElementTree.SubElement(decap, "mode")
+            decap = ET.SubElement(vni_el, "decapsulation")
+            mode = ET.SubElement(decap, "mode")
             mode.text = "service-vlan-per-port"
-            vlan_e = ElementTree.SubElement(vni_el, "vlan")
+            vlan_e = ET.SubElement(vni_el, "vlan")
             vlan_e.text = str(seg_id)
 
     def create_network(self, context):
@@ -455,7 +495,9 @@ class NetconfOpenConfigDriver(object):
             vlan_item = net_instance.vlans.add(seg_id_new)
             vlan_item.config.operation = nc_op.MERGE.value
             vlan_item.config.name = self._uuid_as_hex(n_new['id'])
-            vlan_item.config.status = constants.VLAN_ACTIVE if adm_up_new else constants.VLAN_SUSPENDED
+            vlan_item.config.status = (
+                constants.VLAN_ACTIVE if adm_up_new else constants.VLAN_SUSPENDED
+            )
             self.client.edit_config(net_instances)
         else:
             del_instances = NetworkInstances()
@@ -476,7 +518,9 @@ class NetconfOpenConfigDriver(object):
             new_vlan = add_instance.vlans.add(seg_id_new)
             new_vlan.config.operation = nc_op.MERGE.value
             new_vlan.config.name = self._uuid_as_hex(n_new['id'])
-            new_vlan.config.status = constants.VLAN_ACTIVE if adm_up_new else constants.VLAN_SUSPENDED
+            new_vlan.config.status = (
+                constants.VLAN_ACTIVE if adm_up_new else constants.VLAN_SUSPENDED
+            )
             new_vlan.vlan_id = seg_id_new
             if CONF[self.device].evpn:
                 self._append_vni_config(add_instances, seg_id_new, remove=False)
@@ -527,16 +571,16 @@ class NetconfOpenConfigDriver(object):
     def create_non_bond(self, context, switched_vlan, links):
         port = context.current
         admin_up = port.get("admin_state_up")
-        root = ElementTree.Element("config")
+        root = ET.Element("config")
         for link in links:
             pid = self._port_id_resub(link.get(constants.PORT_ID, ''))
-            intf = ElementTree.SubElement(root, "interface", xmlns="http://pica8.com/xorplus/interface")
-            ge = ElementTree.SubElement(intf, "gigabit-ethernet")
+            intf = ET.SubElement(root, "interface", xmlns="http://pica8.com/xorplus/interface")
+            ge = ET.SubElement(intf, "gigabit-ethernet")
             common.txt_subelement(ge, "name", pid)
             common.txt_subelement(ge, "disable", "false" if admin_up else "true")
             if switched_vlan is not None:
-                fam = ElementTree.SubElement(ge, "family")
-                eth_sw = ElementTree.SubElement(fam, "ethernet-switching")
+                fam = ET.SubElement(ge, "family")
+                eth_sw = ET.SubElement(fam, "ethernet-switching")
                 common.txt_subelement(eth_sw, "native-vlan-id", str(switched_vlan.config.access_vlan))
                 common.txt_subelement(eth_sw, "port-mode", "access")
         self.client.edit_config(root)
@@ -576,6 +620,7 @@ class NetconfOpenConfigDriver(object):
             agg_iface.aggregation.switched_vlan = switched_vlan
             agg_iface.aggregation.switched_vlan.config.operation = nc_op.REPLACE.value
         else:
+            # remove property to avoid the "must be VlanSwitchedVlan" error
             del agg_iface.aggregation.switched_vlan
 
         # EVPN ESI-lag logic
@@ -587,7 +632,6 @@ class NetconfOpenConfigDriver(object):
             with manager.connect(**self.client.get_client_args()) as nc_client:
                 with nc_client.locked("running"):
                     if es_id_str and es_mac_str:
-                        # user-supplied
                         es_id = int(es_id_str)
                         es_mac = es_mac_str.strip().upper()
                         (es_id, es_mac) = get_unique_esi_lag(
@@ -597,7 +641,6 @@ class NetconfOpenConfigDriver(object):
                         )
                         LOG.info(f"User-supplied ESI-lag for aggregator => es_id={es_id}, mac={es_mac}")
                     else:
-                        # auto
                         (es_id, es_mac) = get_unique_esi_lag(nc_client)
                         LOG.info(f"Auto-generated ESI-lag for aggregator => es_id={es_id}, mac={es_mac}")
 
@@ -677,16 +720,16 @@ class NetconfOpenConfigDriver(object):
         admin_up = port.get("admin_state_up")
         seg_id = context.network.current.get("provider:segmentation_id")
         net_type = context.network.current.get("provider:network_type")
-        root = ElementTree.Element("config")
+        root = ET.Element("config")
         for link in links:
             pid = self._port_id_resub(link.get(constants.PORT_ID, ''))
-            intf = ElementTree.SubElement(root, "interface", xmlns="http://pica8.com/xorplus/interface")
-            ge = ElementTree.SubElement(intf, "gigabit-ethernet")
+            intf = ET.SubElement(root, "interface", xmlns="http://pica8.com/xorplus/interface")
+            ge = ET.SubElement(intf, "gigabit-ethernet")
             common.txt_subelement(ge, "name", pid)
             common.txt_subelement(ge, "disable", "false" if admin_up else "true")
             if net_type == n_const.TYPE_VLAN and seg_id:
-                fam = ElementTree.SubElement(ge, "family")
-                eth_sw = ElementTree.SubElement(fam, "ethernet-switching")
+                fam = ET.SubElement(ge, "family")
+                eth_sw = ET.SubElement(fam, "ethernet-switching")
                 common.txt_subelement(eth_sw, "native-vlan-id", str(seg_id))
                 common.txt_subelement(eth_sw, "port-mode", "access")
         self.client.edit_config(root)
@@ -801,19 +844,19 @@ class NetconfOpenConfigDriver(object):
             self.delete_pre_conf_aggregate(links)
 
     def delete_non_bond(self, context, links):
-        root = ElementTree.Element("config")
+        root = ET.Element("config")
         net_type = context.network.current.get("provider:network_type")
         seg_id = context.network.current.get("provider:segmentation_id")
         for link in links:
             pid = self._port_id_resub(link.get(constants.PORT_ID, ''))
-            intf = ElementTree.SubElement(root, "interface", xmlns="http://pica8.com/xorplus/interface")
+            intf = ET.SubElement(root, "interface", xmlns="http://pica8.com/xorplus/interface")
             intf.set("operation", "remove")
-            ge = ElementTree.SubElement(intf, "gigabit-ethernet")
+            ge = ET.SubElement(intf, "gigabit-ethernet")
             common.txt_subelement(ge, "name", pid)
             common.txt_subelement(ge, "disable", "true")
             if net_type == n_const.TYPE_VLAN and seg_id:
-                fam = ElementTree.SubElement(ge, "family")
-                eth_sw = ElementTree.SubElement(fam, "ethernet-switching")
+                fam = ET.SubElement(ge, "family")
+                eth_sw = ET.SubElement(fam, "ethernet-switching")
                 common.txt_subelement(eth_sw, "port-mode", "access")
         self.client.edit_config(root)
 
@@ -910,9 +953,9 @@ class NetconfOpenConfigDriver(object):
         """
         If they're missing in evpn_info, we raise an error. DF pref can default from config.
         """
-        evpn_el = ElementTree.Element("evpn")
+        evpn_el = ET.Element("evpn")
         evpn_el.set("operation", "merge" if merge else "replace")
-        mh_el = ElementTree.SubElement(evpn_el, "mh")
+        mh_el = ET.SubElement(evpn_el, "mh")
 
         if 'es_id' not in evpn_info or 'es_sys_mac' not in evpn_info:
             raise ValueError("Missing required ES-ID or ES-sys-mac in evpn_info.")
@@ -921,8 +964,8 @@ class NetconfOpenConfigDriver(object):
         es_sys_mac = evpn_info['es_sys_mac']
         es_df_pref = evpn_info.get('es_df_pref', CONF[self.device].evpn_es_df_pref)
 
-        ElementTree.SubElement(mh_el, "es-id").text = str(es_id)
-        ElementTree.SubElement(mh_el, "es-sys-mac").text = es_sys_mac
-        ElementTree.SubElement(mh_el, "es-df-pref").text = str(es_df_pref)
+        ET.SubElement(mh_el, "es-id").text = str(es_id)
+        ET.SubElement(mh_el, "es-sys-mac").text = es_sys_mac
+        ET.SubElement(mh_el, "es-df-pref").text = str(es_df_pref)
 
         agg_iface.evpn = evpn_el
