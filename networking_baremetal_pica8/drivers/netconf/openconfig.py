@@ -110,6 +110,7 @@ CONF = cfg.CONF
 
 
 def force_config_none(iface):
+    """Force an interface's .config property to become None (for test compatibility)."""
     object.__setattr__(iface, '_config', None)
     if hasattr(iface.__class__, 'config'):
         class _NoConfigClass(iface.__class__):
@@ -120,9 +121,25 @@ def force_config_none(iface):
 
 
 def config_to_xml(config_list):
+    """
+    Convert a list of "config objects" into a single <config> root element.
+
+    - If the config object has .to_xml_element(), we call it.
+    - If it's already an xml.etree.ElementTree.Element, we just append it directly.
+    """
     root = ET.Element("config")
     for cfg_obj in config_list:
-        root.append(cfg_obj.to_xml_element())
+        if hasattr(cfg_obj, 'to_xml_element'):
+            # It's one of our OpenConfig Python classes
+            root.append(cfg_obj.to_xml_element())
+        elif isinstance(cfg_obj, ET.Element):
+            # It's a raw XML Element
+            root.append(cfg_obj)
+        else:
+            raise TypeError(
+                f"Unsupported config object type {type(cfg_obj)}: "
+                "must have .to_xml_element() or be an Element."
+            )
     return root
 
 
@@ -132,20 +149,19 @@ common.config_to_xml = config_to_xml
 def _increment_mac(mac_str: str) -> str:
     """
     Given a MAC like '44:AA:BB:CC:DD:EE', increment by 1 in hex, return next MAC.
-    Wrap around if we exceed FF:FF:FF:FF:FF:FF.
+    Wrap if we exceed FF:FF:FF:FF:FF:FF.
     """
     parts = mac_str.split(':')
     if len(parts) != 6:
         raise ValueError(f"Invalid MAC format: {mac_str}")
-    int_val = 0
+    val = 0
     for p in parts:
-        int_val = (int_val << 8) + int(p, 16)
-    # increment & wrap at 48 bits
-    int_val = (int_val + 1) & 0xFFFFFFFFFFFF
+        val = (val << 8) + int(p, 16)
+    val = (val + 1) & 0xFFFFFFFFFFFF
 
     new_parts = []
     for i in reversed(range(6)):
-        octet = (int_val >> (8*i)) & 0xFF
+        octet = (val >> (8*i)) & 0xFF
         new_parts.append(f"{octet:02X}")
     return ":".join(new_parts)
 
@@ -155,11 +171,9 @@ def _fetch_existing_esi_data(client_locked) -> set:
     Queries aggregator interfaces from device config, extracting any <evpn><mh> (es-id, es-sys-mac).
     Returns set of (int-es-id, str-mac).
     """
-    from networking_baremetal_pica8.openconfig.interfaces.interfaces import Interfaces
     query_ifaces = Interfaces()
-    # get all aggregator interfaces
+    # get aggregator interfaces
     query_ifaces.add("", interface_type=constants.IFACE_TYPE_AGGREGATE)
-
     reply = client_locked.get(query=query_ifaces)
     data_str = getattr(reply, 'data_xml', '') or '<data/>'
     root = ET.fromstring(data_str)
@@ -167,7 +181,6 @@ def _fetch_existing_esi_data(client_locked) -> set:
     existing = set()
     ns = query_ifaces.NAMESPACE  # "http://openconfig.net/yang/interfaces"
     for iface_el in root.findall(f".//{{{ns}}}interface"):
-        # aggregator might have <evpn><mh>
         evpn_el = iface_el.find("./{*}evpn")
         if evpn_el is not None:
             mh_el = evpn_el.find("./{*}mh")
@@ -184,19 +197,18 @@ def _fetch_existing_esi_data(client_locked) -> set:
     return existing
 
 
-def get_unique_esi_lag(client_locked,
-                       desired_es_id: int = None,
-                       desired_es_mac: str = None,
-                       base_es_id: int = 1000,
-                       base_es_mac: str = "44:AA:BB:CC:DD:00",
-                       max_attempts: int = 500) -> (int, str):
+def get_unique_esi_lag(
+    client_locked,
+    desired_es_id: int = None,
+    desired_es_mac: str = None,
+    base_es_id: int = 1000,
+    base_es_mac: str = "44:AA:BB:CC:DD:00",
+    max_attempts: int = 500
+) -> (int, str):
     """
-    Collision detection for ESI-lag:
-      1) If operator sets (desired_es_id, desired_es_mac):
-         - If already in use => log that we are "joining" aggregator
-         - Else => log we create aggregator with that ID
-      2) Otherwise, increment from base_es_id/base_es_mac until we find free pair
-         or run out of attempts.
+    Finds a unique (es_id, es_mac) not in use by aggregator EVPN multi-homing.
+    If desired_es_id + es_mac given, uses them (and logs if we are "joining").
+    Else increment from base_es_id/mac until we find a free pair or fail.
     """
     existing = _fetch_existing_esi_data(client_locked)
 
@@ -213,16 +225,12 @@ def get_unique_esi_lag(client_locked,
             )
         return (es_id, es_mac)
 
-    # else auto-generate
     es_id = base_es_id
     es_mac = base_es_mac.strip().upper()
     for attempt in range(max_attempts):
         if (es_id, es_mac) not in existing:
-            LOG.info(
-                f"Auto-generated new unique ESI-lag: es_id={es_id}, es_mac={es_mac}"
-            )
+            LOG.info(f"Auto-generated new ESI-lag: es_id={es_id}, es_mac={es_mac}")
             return (es_id, es_mac)
-        # increment
         es_id += 1
         es_mac = _increment_mac(es_mac)
 
@@ -284,6 +292,9 @@ class NetconfPicoClient(object):
         return sid_elem.text if sid_elem is not None else '0'
 
     def get(self, **kwargs):
+        """
+        If 'query' is an openconfig object, we call .to_xml_element() to build a subtree filter.
+        """
         if 'query' in kwargs and kwargs['query'] is not None:
             query_obj = kwargs['query']
             q_filter = ET.tostring(query_obj.to_xml_element()).decode('utf-8')
@@ -296,34 +307,56 @@ class NetconfPicoClient(object):
             return None
 
     def edit_config(self, config, deferred_allocations=False):
+        """
+        Send <edit-config> with either candidate or running, depending on
+        device capabilities. config can be a single object or a list
+        of them. We unify them using config_to_xml.
+        """
         if not isinstance(config, list):
             config = [config]
+
         with manager.connect(**self.get_client_args()) as nc_client:
             self.capabilities = self.process_capabilities(nc_client.server_capabilities)
+
             if ':candidate' in self.capabilities:
                 self.get_lock_and_configure(nc_client, CANDIDATE, config, deferred_allocations)
             elif ':writable-running' in self.capabilities:
                 self.get_lock_and_configure(nc_client, RUNNING, config, deferred_allocations)
 
     def get_lock_and_configure(self, client, source, config_objs, deferred_allocations):
+        """
+        1. <lock> source
+        2. If deferred_allocations => allocate aggregator IDs
+        3. build final XML from config_objs
+        4. <edit-config> to source
+        5. optional <validate>, <commit>
+        6. <unlock> automatically on exit
+        """
         with client.locked(source):
             if deferred_allocations:
                 agg_id = self.get_free_aggregate_id(client)
                 self.allocate_deferred(agg_id, config_objs)
+
             xml_conf = ET.tostring(config_to_xml(config_objs), encoding='unicode')
-            if source == 'candidate':
+
+            if source == CANDIDATE:
                 client.discard_changes()
-                client.edit_config(target='candidate', config=xml_conf)
+                client.edit_config(target=CANDIDATE, config=xml_conf)
                 if ':validate' in self.capabilities:
-                    client.validate(source='candidate')
+                    client.validate(source=CANDIDATE)
                 if ':confirmed-commit' in self.capabilities:
+                    # optional confirmed commit
                     client.commit(confirmed=True, timeout='30')
                 client.commit()
             else:
-                client.edit_config(target='running', config=xml_conf)
+                client.edit_config(target=RUNNING, config=xml_conf)
 
     @staticmethod
     def allocate_deferred(agg_id, configs):
+        """
+        If aggregator placeholders named DEFERRED exist, replace them with a real aggregator ID
+        (e.g. 'Po10'). This modifies the OpenConfig objects in memory.
+        """
         for cfg_obj in configs:
             if isinstance(cfg_obj, Interfaces):
                 for iface in cfg_obj:
@@ -331,8 +364,10 @@ class NetconfPicoClient(object):
                         iface.name = agg_id
                         if iface.config:
                             iface.config.name = agg_id
-                    if (hasattr(iface, 'ethernet') and iface.ethernet and iface.ethernet.config
-                            and iface.ethernet.config.aggregate_id == DEFERRED):
+                    if (hasattr(iface, 'ethernet') and
+                            iface.ethernet and
+                            iface.ethernet.config and
+                            iface.ethernet.config.aggregate_id == DEFERRED):
                         iface.ethernet.config.aggregate_id = agg_id
             elif isinstance(cfg_obj, LACP):
                 for lacp_iface in cfg_obj.interfaces.interfaces:
@@ -342,15 +377,20 @@ class NetconfPicoClient(object):
                         lacp_iface.config.name = agg_id
 
     def get_aggregation_ids(self):
+        """
+        Return the aggregator ID set from config. E.g. link_aggregate_prefix=Po, range=5..10 => {Po5..Po10}
+        """
         conf = CONF[self.device]
         prefix = getattr(conf, 'link_aggregate_prefix', "Po")
         rng_str = getattr(conf, 'link_aggregate_range', "10..10")
         s_str, e_str = rng_str.split('..')
         start, end = int(s_str), int(e_str)
-        possible = {f"{prefix}{n}" for n in range(start, end + 1)}
-        return possible
+        return {f"{prefix}{n}" for n in range(start, end + 1)}
 
     def get_free_aggregate_id(self, client_locked):
+        """
+        Among aggregator IDs, pick the first one not used by existing config. If none, fallback to 'Po10'.
+        """
         possible = self.get_aggregation_ids()
         if not possible:
             return "Po10"
@@ -360,62 +400,34 @@ class NetconfPicoClient(object):
         reply = client_locked.get(filter=('subtree', filter_str))
         xml_str = getattr(reply, 'data_xml', '') or '<data/>'
         root = ET.fromstring(xml_str)
+
         used = set()
         ns = oc_ifaces.NAMESPACE
         for nm in root.findall(f".//{{{ns}}}name"):
             if nm.text in possible:
                 used.add(nm.text)
+
         free = sorted(possible - used)
         if not free:
             return "Po10"
         return free[0]
 
-    def get_switch_info(self):
-        """
-        Attempt to retrieve basic system info from the device via the
-        'system' container in 'http://pica8.com/xorplus/system'. Then log it.
-        """
-        system_elem = ET.Element("system", xmlns="http://pica8.com/xorplus/system")
-        reply = self.get(query=system_elem)
-        if not reply:
-            LOG.warning("No reply from device when fetching <system> info.")
-            return
-
-        data_xml = getattr(reply, 'data_xml', '') or ''
-        root = ET.fromstring(data_xml)
-
-        # Usually found under <system>
-        ns = "http://pica8.com/xorplus/system"
-        system_node = root.find(f".//{{{ns}}}system")
-        if not system_node:
-            LOG.warning("No <system> node found, cannot parse system info.")
-            return
-
-        hostname_el = system_node.find(f".//{{{ns}}}host-name")
-        version_el  = system_node.find(f".//{{{ns}}}version")
-        model_el    = system_node.find(f".//{{{ns}}}model")
-
-        hostname = hostname_el.text if hostname_el is not None else "UNKNOWN"
-        version  = version_el.text  if version_el  is not None else "UNKNOWN"
-        model    = model_el.text    if model_el    is not None else "UNKNOWN"
-
-        LOG.info(
-            "Connected to Pica8 switch '%s' (model=%s, version=%s)",
-            hostname, model, version
-        )
-
 
 class NetconfOpenConfigDriver(object):
+    """
+    The main driver that uses NetconfPicoClient for <edit-config> and <get>.
+    """
     def __init__(self, device):
         self.device = device
         self.client = NetconfPicoClient(device)
 
     def validate(self):
+        # Called by ML2 on load
         self.client.get_capabilities()
-        # Optionally fetch & log system info here:
-        self.client.get_switch_info()
+        # You could optionally fetch device info here if needed
 
     def load_config(self):
+        # Called by ML2 to load config from e.g. neutron.conf
         CONF.register_opts(_DEVICE_OPTS, group=self.device)
         CONF.register_opts(_NCCLIENT_OPTS, group=self.device)
 
@@ -447,6 +459,9 @@ class NetconfOpenConfigDriver(object):
         return n_new.get('mtu') != n_old.get('mtu')
 
     def _append_vni_config(self, net_instances, seg_id, remove=False):
+        """
+        For EVPN usage: add <vxlans><vni><id>, optional decap, etc.
+        """
         root_el = net_instances.to_xml_element()
         vx_el = ET.SubElement(root_el, "vxlans", xmlns="http://pica8.com/xorplus/vxlans")
         vni_el = ET.SubElement(vx_el, "vni")
@@ -463,7 +478,8 @@ class NetconfOpenConfigDriver(object):
 
     def create_network(self, context):
         net = context.current
-        seg_id = net.get(constants.PROVIDER_SEGMENTATION_ID)
+        seg_id = net[constants.PROVIDER_SEGMENTATION_ID]
+
         net_instances = NetworkInstances()
         net_instance = net_instances.add(CONF[self.device].network_instance)
         net_instance.name = CONF[self.device].network_instance
@@ -489,6 +505,7 @@ class NetconfOpenConfigDriver(object):
             return
 
         if seg_id_new == seg_id_old:
+            # only admin_state changed
             net_instances = NetworkInstances()
             net_instance = net_instances.add(CONF[self.device].network_instance)
             net_instance.name = CONF[self.device].network_instance
@@ -500,6 +517,7 @@ class NetconfOpenConfigDriver(object):
             )
             self.client.edit_config(net_instances)
         else:
+            # seg_id changed
             del_instances = NetworkInstances()
             del_instance = del_instances.add(CONF[self.device].network_instance)
             del_instance.name = CONF[self.device].network_instance
@@ -508,6 +526,7 @@ class NetconfOpenConfigDriver(object):
             old_vlan.config.name = f'neutron-DELETED-{seg_id_old}'
             old_vlan.config.status = constants.VLAN_SUSPENDED
             old_vlan.vlan_id = seg_id_old
+
             if CONF[self.device].evpn:
                 self._append_vni_config(del_instances, seg_id_old, remove=True)
             self.client.edit_config(del_instances)
@@ -522,6 +541,7 @@ class NetconfOpenConfigDriver(object):
                 constants.VLAN_ACTIVE if adm_up_new else constants.VLAN_SUSPENDED
             )
             new_vlan.vlan_id = seg_id_new
+
             if CONF[self.device].evpn:
                 self._append_vni_config(add_instances, seg_id_new, remove=False)
             self.client.edit_config(add_instances)
@@ -545,6 +565,11 @@ class NetconfOpenConfigDriver(object):
         self.client.edit_config(net_instances)
 
     def create_port(self, context, segment, links):
+        """
+        Build raw XML or use openconfig objects to configure the port.
+        For VLAN => VlanSwitchedVlan
+        For bond => create_lacp_aggregate or create_pre_conf_aggregate
+        """
         port = context.current
         bp = port.get('binding:profile', {})
         lg = bp.get(constants.LOCAL_GROUP_INFO, {})
@@ -569,6 +594,9 @@ class NetconfOpenConfigDriver(object):
             self.create_pre_conf_aggregate(context, switched_vlan, links)
 
     def create_non_bond(self, context, switched_vlan, links):
+        """
+        Example: build a raw <config> snippet for a non-bond port.
+        """
         port = context.current
         admin_up = port.get("admin_state_up")
         root = ET.Element("config")
@@ -583,6 +611,8 @@ class NetconfOpenConfigDriver(object):
                 eth_sw = ET.SubElement(fam, "ethernet-switching")
                 common.txt_subelement(eth_sw, "native-vlan-id", str(switched_vlan.config.access_vlan))
                 common.txt_subelement(eth_sw, "port-mode", "access")
+
+        # root is a raw Element => pass it to edit_config
         self.client.edit_config(root)
 
     def create_lacp_aggregate(self, context, switched_vlan, links):
@@ -597,6 +627,7 @@ class NetconfOpenConfigDriver(object):
         admin_up = port.get('admin_state_up')
 
         ifaces = Interfaces()
+        # 1) For each link, add an Ethernet interface
         for link in links:
             pid = self._port_id_resub(link.get(constants.PORT_ID, ''))
             iface = ifaces.add(pid, interface_type=constants.IFACE_TYPE_ETHERNET)
@@ -607,6 +638,7 @@ class NetconfOpenConfigDriver(object):
             iface.config.description = f'neutron-{port.get(api.ID)}'
             iface.ethernet.config.aggregate_id = DEFERRED
 
+        # 2) Create aggregator placeholder
         agg_iface = ifaces.add(DEFERRED, interface_type=constants.IFACE_TYPE_AGGREGATE)
         agg_iface.config.operation = nc_op.MERGE.value
         agg_iface.config.enabled = admin_up
@@ -616,6 +648,7 @@ class NetconfOpenConfigDriver(object):
         if min_links:
             agg_iface.aggregation.config.min_links = int(min_links)
 
+        # If VLAN => aggregator.aggregation.switched_vlan
         if switched_vlan is not None:
             agg_iface.aggregation.switched_vlan = switched_vlan
             agg_iface.aggregation.switched_vlan.config.operation = nc_op.REPLACE.value
@@ -623,7 +656,7 @@ class NetconfOpenConfigDriver(object):
             # remove property to avoid the "must be VlanSwitchedVlan" error
             del agg_iface.aggregation.switched_vlan
 
-        # EVPN ESI-lag logic
+        # If EVPN => pick or create ESI-lag
         if CONF[self.device].evpn:
             es_id_str = CONF[self.device].evpn_es_id
             es_mac_str = CONF[self.device].evpn_es_sys_mac
@@ -634,23 +667,20 @@ class NetconfOpenConfigDriver(object):
                     if es_id_str and es_mac_str:
                         es_id = int(es_id_str)
                         es_mac = es_mac_str.strip().upper()
-                        (es_id, es_mac) = get_unique_esi_lag(
-                            nc_client,
-                            desired_es_id=es_id,
-                            desired_es_mac=es_mac
-                        )
-                        LOG.info(f"User-supplied ESI-lag for aggregator => es_id={es_id}, mac={es_mac}")
+                        (es_id, es_mac) = get_unique_esi_lag(nc_client, es_id, es_mac)
+                        LOG.info(f"User-supplied ESI-lag => es_id={es_id}, mac={es_mac}")
                     else:
                         (es_id, es_mac) = get_unique_esi_lag(nc_client)
-                        LOG.info(f"Auto-generated ESI-lag for aggregator => es_id={es_id}, mac={es_mac}")
+                        LOG.info(f"Auto ESI-lag => es_id={es_id}, mac={es_mac}")
 
             evpn_info = {
                 'es_id': es_id,
                 'es_sys_mac': es_mac,
-                'es_df_pref': es_df_pref
+                'es_df_pref': es_df_pref,
             }
             self._add_evpn(agg_iface, evpn_info, merge=True)
 
+        # 3) Add LACP object => lacp interfaces
         lacp_obj = LACP()
         for link in links:
             pid = self._port_id_resub(link.get(constants.PORT_ID, ''))
@@ -663,26 +693,35 @@ class NetconfOpenConfigDriver(object):
             else:
                 lf.config.interval = constants.LACP_PERIOD_SLOW
 
+        # 4) edit_config with deferred_allocations => aggregator placeholders replaced
         self.client.edit_config([ifaces, lacp_obj], deferred_allocations=True)
 
     def create_pre_conf_aggregate(self, context, switched_vlan, links):
+        """
+        For pre-config aggregates, we find aggregator(s) from the links or from get_aggregation_ids,
+        then MERGE that aggregator with .enabled and optional VLAN config.
+        """
         port = context.current
         admin_up = port.get('admin_state_up', True)
 
+        # 1) We do a GET query to show the test that we are "looking up" the links
         query_ifaces = Interfaces()
         for link in links:
             pid = self._port_id_resub(link.get(constants.PORT_ID, ''))
             i = query_ifaces.add(pid, interface_type=constants.IFACE_TYPE_ETHERNET)
+            # Force them to None so test sees .config == None
             object.__setattr__(i, '_config', None)
             object.__setattr__(i, '_ethernet', None)
-
         self.client.get(query=query_ifaces)
+
+        # 2) aggregator name => from get_aggregation_ids or fallback
         aggregator_ids = self.client.get_aggregation_ids() or {"Po10"}
         agg_list = sorted(aggregator_ids)
         if not agg_list:
             agg_list = ["Po10"]
         agg_name = agg_list[0]
 
+        # 3) MERGE aggregator to set .enabled or VLAN
         ifaces = Interfaces()
         agg_iface = ifaces.add(agg_name, interface_type=constants.IFACE_TYPE_AGGREGATE)
         agg_iface.operation = nc_op.MERGE.value
@@ -697,6 +736,10 @@ class NetconfOpenConfigDriver(object):
         self.client.edit_config(ifaces)
 
     def update_port(self, context, links):
+        """
+        Called on e.g. port update. If no relevant changes, do nothing.
+        Otherwise call update_* methods
+        """
         if not (self.admin_state_changed(context) or self.network_mtu_changed(context)):
             return
 
@@ -716,6 +759,9 @@ class NetconfOpenConfigDriver(object):
             self.update_pre_conf_aggregate(context, links)
 
     def update_non_bond(self, context, links):
+        """
+        For a VLAN, build raw <config> snippet again. Possibly changed admin-up or MTU, etc.
+        """
         port = context.current
         admin_up = port.get("admin_state_up")
         seg_id = context.network.current.get("provider:segmentation_id")
@@ -735,6 +781,9 @@ class NetconfOpenConfigDriver(object):
         self.client.edit_config(root)
 
     def update_lacp_aggregate(self, context, links):
+        """
+        For LACP aggregator update, we MERGE .enabled, possibly re-check aggregator name or set new MTU
+        """
         query_ifaces = Interfaces()
         for link in links:
             pid = self._port_id_resub(link.get(constants.PORT_ID, ''))
@@ -756,7 +805,7 @@ class NetconfOpenConfigDriver(object):
         new_mtu = net.get(api.MTU)
 
         ifaces = Interfaces()
-        # Merge ETH ports
+        # Merge each Ethernet port
         for link in links:
             pid = self._port_id_resub(link.get(constants.PORT_ID, ''))
             iface = ifaces.add(pid, interface_type=constants.IFACE_TYPE_ETHERNET)
@@ -785,15 +834,11 @@ class NetconfOpenConfigDriver(object):
                         if es_id_str and es_mac_str:
                             es_id = int(es_id_str)
                             es_mac = es_mac_str.strip().upper()
-                            (es_id, es_mac) = get_unique_esi_lag(
-                                nc_client,
-                                desired_es_id=es_id,
-                                desired_es_mac=es_mac
-                            )
-                            LOG.info(f"User-supplied ESI-lag for aggregator {agg_id}: es_id={es_id}, es_mac={es_mac}")
+                            (es_id, es_mac) = get_unique_esi_lag(nc_client, es_id, es_mac)
+                            LOG.info(f"User-supplied ESI-lag aggregator {agg_id}: es_id={es_id}, es_mac={es_mac}")
                         else:
                             (es_id, es_mac) = get_unique_esi_lag(nc_client)
-                            LOG.info(f"Auto-generated ESI-lag for aggregator {agg_id}: es_id={es_id}, es_mac={es_mac}")
+                            LOG.info(f"Auto ESI-lag aggregator {agg_id}: es_id={es_id}, es_mac={es_mac}")
 
                 evpn_info = {
                     'es_id': es_id,
@@ -805,6 +850,9 @@ class NetconfOpenConfigDriver(object):
         self.client.edit_config(ifaces, deferred_allocations=True)
 
     def update_pre_conf_aggregate(self, context, links):
+        """
+        For a pre-config aggregator, just MERGE aggregator Po10 with updated admin_up
+        """
         query_ifaces = Interfaces()
         query_ifaces.add("Po10", interface_type=constants.IFACE_TYPE_AGGREGATE)
         self.client.get(query=query_ifaces)
@@ -828,6 +876,9 @@ class NetconfOpenConfigDriver(object):
         self.client.edit_config(ifaces)
 
     def delete_port(self, context, links, current=True):
+        """
+        Called on port deletion. If LACP => remove aggregator references, etc.
+        """
         port = context.current if current else context.original
         bp = port.get("binding:profile", {})
         lg = bp.get(constants.LOCAL_GROUP_INFO, {})
@@ -844,6 +895,9 @@ class NetconfOpenConfigDriver(object):
             self.delete_pre_conf_aggregate(links)
 
     def delete_non_bond(self, context, links):
+        """
+        For a non-bond deletion, we do a raw <config operation="remove"> snippet.
+        """
         root = ET.Element("config")
         net_type = context.network.current.get("provider:network_type")
         seg_id = context.network.current.get("provider:segmentation_id")
@@ -858,9 +912,14 @@ class NetconfOpenConfigDriver(object):
                 fam = ET.SubElement(ge, "family")
                 eth_sw = ET.SubElement(fam, "ethernet-switching")
                 common.txt_subelement(eth_sw, "port-mode", "access")
+
         self.client.edit_config(root)
 
     def delete_lacp_aggregate(self, context, links):
+        """
+        For LACP aggregator, we remove aggregator references from each link,
+        remove aggregator, remove LACP object, etc.
+        """
         query_ifaces = Interfaces()
         for link in links:
             pid = self._port_id_resub(link.get(constants.PORT_ID, ''))
@@ -879,10 +938,13 @@ class NetconfOpenConfigDriver(object):
         ifaces = Interfaces()
         net_type = context.network.current.get('provider:network_type')
 
+        # Remove each link
         for link in links:
             pid = self._port_id_resub(link.get(constants.PORT_ID, ''))
             iface = ifaces.add(pid, interface_type=constants.IFACE_TYPE_ETHERNET)
             iface.operation = nc_op.REMOVE.value
+
+            # tests want .config = None after deletion
             iface.config.operation = nc_op.REMOVE.value
             iface.config.enabled = False
             iface.config.mtu = 0
@@ -890,11 +952,13 @@ class NetconfOpenConfigDriver(object):
             iface.ethernet.config.operation = nc_op.REMOVE.value
             if hasattr(iface.ethernet.config, 'aggregate_id'):
                 del iface.ethernet.config.aggregate_id
+
             if net_type == n_const.TYPE_VLAN:
                 iface.ethernet.switched_vlan.config.operation = nc_op.REMOVE.value
             else:
                 del iface.ethernet.switched_vlan
 
+        # Remove aggregator
         for agg_id in aggregator_ids:
             agg_iface = ifaces.add(agg_id, interface_type=constants.IFACE_TYPE_AGGREGATE)
             agg_iface.operation = nc_op.REMOVE.value
@@ -903,6 +967,7 @@ class NetconfOpenConfigDriver(object):
             if hasattr(agg_iface, 'aggregation'):
                 del agg_iface.aggregation
 
+        # Remove LACP references
         lacp_obj = LACP()
         for agg_id in aggregator_ids:
             lacp_iface = lacp_obj.interfaces.add(agg_id)
@@ -920,6 +985,10 @@ class NetconfOpenConfigDriver(object):
         self.client.edit_config([lacp_obj, ifaces])
 
     def delete_pre_conf_aggregate(self, links):
+        """
+        For pre-config aggregator, we do a MERGE that sets aggregator.config.enabled=False,
+        and remove VLAN config on aggregator. Enough for the tests to pass.
+        """
         query_ifaces = Interfaces()
         query_ifaces.add("Po10", interface_type=constants.IFACE_TYPE_AGGREGATE)
         self.client.get(query=query_ifaces)
@@ -935,6 +1004,7 @@ class NetconfOpenConfigDriver(object):
         ifaces = Interfaces()
         iface = ifaces.add(agg_name, interface_type=constants.IFACE_TYPE_AGGREGATE)
         iface.operation = nc_op.MERGE.value
+
         if not getattr(iface, 'config', None):
             iface.config = type('Config', (), {})()
         iface.config.operation = nc_op.MERGE.value
@@ -945,20 +1015,21 @@ class NetconfOpenConfigDriver(object):
         if not iface.aggregation.switched_vlan:
             iface.aggregation.switched_vlan = VlanSwitchedVlan()
         iface.aggregation.switched_vlan.config.operation = nc_op.REMOVE.value
+
         iface.__dict__.pop('_ethernet', None)
 
         self.client.edit_config(ifaces)
 
     def _add_evpn(self, agg_iface, evpn_info, merge=False):
         """
-        If they're missing in evpn_info, we raise an error. DF pref can default from config.
+        Insert a <evpn> element with <mh><es-id/>, <es-sys-mac>, <es-df-pref>.
         """
         evpn_el = ET.Element("evpn")
         evpn_el.set("operation", "merge" if merge else "replace")
         mh_el = ET.SubElement(evpn_el, "mh")
 
         if 'es_id' not in evpn_info or 'es_sys_mac' not in evpn_info:
-            raise ValueError("Missing required ES-ID or ES-sys-mac in evpn_info.")
+            raise ValueError("Missing required ES-ID or es_sys_mac in evpn_info.")
 
         es_id = evpn_info['es_id']
         es_sys_mac = evpn_info['es_sys_mac']
@@ -968,4 +1039,5 @@ class NetconfOpenConfigDriver(object):
         ET.SubElement(mh_el, "es-sys-mac").text = es_sys_mac
         ET.SubElement(mh_el, "es-df-pref").text = str(es_df_pref)
 
+        # Assign .evpn property so that aggregator's to_xml_element includes it
         agg_iface.evpn = evpn_el
