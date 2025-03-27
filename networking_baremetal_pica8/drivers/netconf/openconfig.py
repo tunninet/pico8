@@ -122,7 +122,10 @@ def force_config_none(iface):
 def config_to_xml(config_list):
     """
     Convert a list of "config objects" into a single <config> root.
+    Avoid double wrapping if a single config element is already provided.
     """
+    if len(config_list) == 1 and isinstance(config_list[0], ET.Element) and config_list[0].tag == "config":
+        return config_list[0]
     root = ET.Element("config")
     for cfg_obj in config_list:
         if hasattr(cfg_obj, 'to_xml_element'):
@@ -134,7 +137,6 @@ def config_to_xml(config_list):
     return root
 
 common.config_to_xml = config_to_xml
-
 
 def _increment_mac(mac_str: str) -> str:
     parts = mac_str.split(':')
